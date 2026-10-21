@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "1.0",
+  "sdkVersion": "0.1",
+  "capabilities": ["profile", "friends", "chat", "party", "matchmaking", "match", "leaderboards"],
+  "party": { "maxMembers": 10000 },
+  "multiplayer": { "adapter": "score-race-v1", "minPlayers": 100, "maxPlayers": 100 },
+  "leaderboards": {
+    "points": { "sort": "descending", "period": "all_time", "writePolicy": "verified_match_result", "metric": "points", "operator": "sum" }
+  }
+}

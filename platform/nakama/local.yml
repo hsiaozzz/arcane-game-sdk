@@ -1,0 +1,11 @@
+name: arcane-platform-local
+logger:
+  level: INFO
+runtime:
+  path: /nakama/data/modules
+  js_entrypoint: index.js
+socket:
+  max_message_size_bytes: 262144
+session:
+  token_expiry_sec: 3600
+  refresh_token_expiry_sec: 604800

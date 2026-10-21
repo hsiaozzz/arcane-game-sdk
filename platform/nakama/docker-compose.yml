@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_DB: nakama
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run node init-local.mjs first}
+    volumes:
+      - arcane-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nakama"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  nakama:
+    image: heroiclabs/nakama:3.41.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        /nakama/nakama migrate up --database.address "postgres:${POSTGRES_PASSWORD:?Run init-local.mjs}@postgres:5432/nakama" &&
+        exec /nakama/nakama --config /nakama/data/local.yml
+        --database.address "postgres:${POSTGRES_PASSWORD}@postgres:5432/nakama"
+        --socket.server_key "${NAKAMA_SERVER_KEY:?Run init-local.mjs}"
+        --runtime.http_key "${NAKAMA_HTTP_KEY:?Run init-local.mjs}"
+        --session.encryption_key "${NAKAMA_SESSION_KEY:?Run init-local.mjs}"
+        --session.refresh_encryption_key "${NAKAMA_REFRESH_KEY:?Run init-local.mjs}"
+        --console.username arcane-local
+        --console.password "${NAKAMA_CONSOLE_PASSWORD:?Run init-local.mjs}"
+        --runtime.env "ARCANE_GATEWAY_KEY=${ARCANE_GATEWAY_KEY:?Run init-local.mjs}"
+        --runtime.env "ARCANE_ADMIN_KEY=${ARCANE_ADMIN_KEY:?Run init-local.mjs}"
+        --runtime.env "ARCANE_ADAPTER_IDS=${ARCANE_ADAPTER_IDS:-turn-based-v1,score-race-v1}"
+    volumes:
+      - ./runtime/index.js:/nakama/data/modules/index.js:ro
+      - ./local.yml:/nakama/data/local.yml:ro
+    ports:
+      - "127.0.0.1:${NAKAMA_API_PORT:-7354}:7350"
+      - "127.0.0.1:${NAKAMA_CONSOLE_PORT:-7355}:7351"
+    healthcheck:
+      test: ["CMD", "/nakama/nakama", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  arcane-db:

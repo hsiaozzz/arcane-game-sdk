@@ -1,0 +1,15 @@
+name: arcane-platform
+data_dir: /nakama/data
+logger:
+  level: WARN
+runtime:
+  path: /nakama/data/modules
+  js_entrypoint: index.js
+socket:
+  port: 7350
+  max_message_size_bytes: 262144
+console:
+  port: 7351
+session:
+  token_expiry_sec: 7200
+  refresh_token_expiry_sec: 604800

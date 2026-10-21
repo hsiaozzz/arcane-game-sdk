@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arcane 反应竞速</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101525;color:#edf0ff;font:16px system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:18px}main{width:min(650px,100%)}h1{font-size:30px;margin-bottom:8px}p{color:#b7bfdc;line-height:1.6}button{border:0;border-radius:12px;background:#7fe4c5;color:#122824;padding:14px 20px;font:700 17px system-ui;cursor:pointer}button:disabled{opacity:.45;cursor:default}.answers{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:24px 0}.answers button{font-size:30px;background:#263453;color:#c4cde6}.answers button.target{background:#ffe08b;color:#3a2c0d;box-shadow:0 0 25px #ffdf8b30}#status{min-height:28px;color:#ffe08b}ol{padding-left:25px}li{padding:6px}li.self{color:#7fe4c5}small{color:#8996bc}
+</style></head><body><main>
+<h1>⚡ 反应竞速</h1><p>点亮哪个，就点哪个。先正确完成 10 次的玩家获胜，看看谁的反应更快！</p>
+<button id="join">加入匹配</button> <button id="community">社区</button><p id="status">连接平台中…</p>
+<div class="answers"><button data-answer="0" disabled>●</button><button data-answer="1" disabled>◆</button><button data-answer="2" disabled>▲</button><button data-answer="3" disabled>■</button></div>
+<ol id="scores"></ol><small>多人反应竞速，邀请朋友一起来挑战。</small>
+</main><script type="module">
+import { ArcaneGame, createMatchConnection } from '/sdk/index.js';
+if(!window.__ARCANE_GAME__&&window.parent!==window){try{const p=new URLSearchParams(location.search),host=p.get('arcaneHostOrigin'),channel=p.get('arcaneChannel');if(new URL(host).origin===host&&/^[a-f0-9]{48}$/i.test(channel||''))window.__ARCANE_GAME__={protocol:'arcane-game-sdk',version:1,hostOrigin:host,channelId:channel};}catch{}}
+const status=document.querySelector('#status'),join=document.querySelector('#join'),scores=document.querySelector('#scores'),buttons=[...document.querySelectorAll('[data-answer]')];
+let sdk,context,connection,state,polling=false,busy=false;
+const showError=error=>{status.textContent=error?.message||'平台暂不可用，请稍后重试';};
+function render(next){
+ if(next.challenge?.id!==state?.challenge?.id||next.status!=='playing')busy=false;
+ state=next;buttons.forEach((button,i)=>{button.disabled=next.status!=='playing';button.classList.toggle('target',next.challenge?.target===i);});
+ if(next.status==='waiting')status.textContent=`等待选手连接 ${next.connected??0}/${next.required??next.players.length}`;
+ else if(next.status==='playing')status.textContent=`正确点击亮起的图形！目标 ${next.targetScore} 次`;
+ else {const rank=[...next.players].sort((a,b)=>next.scores[next.players.indexOf(b)]-next.scores[next.players.indexOf(a)]||next.players.indexOf(a)-next.players.indexOf(b)).indexOf(context.gameUserId)+1;status.textContent=next.reason==='join_timeout'?'选手未到齐，本场不计分':`比赛结束！你的名次：第 ${rank} 名`;join.disabled=false;join.textContent='再来一场';}
+ scores.replaceChildren(...next.players.map((id,i)=>({id,score:next.scores?.[i]??0})).sort((a,b)=>b.score-a.score).map(row=>{const li=document.createElement('li');li.textContent=`${row.id===context.gameUserId?'我':row.id.slice(-6)}：${row.score}`;li.classList.toggle('self',row.id===context.gameUserId);return li;}));
+}
+try{sdk=await ArcaneGame.connect();context=await sdk.context.get();status.textContent='准备好了，邀请另一位玩家加入吧。';}catch(error){showError(error);join.disabled=true;}
+document.querySelector('#community').onclick=()=>sdk?.social.open({tab:'leaderboards'}).catch(showError);
+join.onclick=async()=>{if(polling||!sdk)return;polling=true;join.disabled=true;connection?.close();try{
+ let queue=(await sdk.matchmaking.join()).queue;
+ while(queue?.status==='waiting'){status.textContent='匹配中…';await new Promise(resolve=>setTimeout(resolve,750));queue=(await sdk.matchmaking.status({queueId:queue.queueId})).queue;}
+ if(queue?.status!=='matched')throw new Error('匹配已取消');
+ connection=createMatchConnection(await sdk.match.ticket({matchRunId:queue.matchRunId}),{maxReconnectAttempts:3,refreshTicket:()=>sdk.match.ticket({matchRunId:queue.matchRunId})});
+ connection.onState(message=>render(message.state));connection.on('error',error=>{busy=false;showError(error);});await connection.ready;
+}catch(error){showError(error);join.disabled=false;}finally{polling=false;}};
+buttons.forEach(button=>button.onclick=()=>{if(busy||state?.status!=='playing'||!state.challenge)return;try{connection.sendInput({answer:Number(button.dataset.answer),challengeId:state.challenge.id});busy=true;}catch(error){busy=false;showError(error);}});
+window.addEventListener('pagehide',()=>{connection?.close();sdk?.close();});
+</script></body></html>

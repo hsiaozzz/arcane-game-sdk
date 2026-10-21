@@ -1,0 +1,34 @@
+{
+  "name": "arcane-game-sdk-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source browser game SDK and self-hosted multiplayer platform.",
+  "type": "module",
+  "license": "MIT",
+  "workspaces": ["packages/game-sdk", "platform"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test packages/game-sdk/tests/*.test.mjs platform/tests/*.test.mjs",
+    "sdk:build": "node platform/tools/build-sdk.mjs",
+    "sdk:test": "node --test packages/game-sdk/tests/*.test.mjs",
+    "sdk:typecheck": "tsc --strict --noEmit --lib es2020,dom packages/game-sdk/examples/typed-usage.ts",
+    "sdk:release": "node tools/package-release.mjs",
+    "platform:local": "node platform/tools/local-stack.mjs",
+    "platform:start": "node platform/server/main.mjs",
+    "platform:test": "node --test platform/tests/*.test.mjs",
+    "platform:test:local": "node platform/tools/test-local.mjs",
+    "platform:smoke": "node platform/tools/smoke.mjs",
+    "platform:browser-smoke": "node platform/tools/browser-smoke.mjs",
+    "platform:load:multiplayer": "node platform/tools/multiplayer-load.mjs",
+    "platform:smoke:party": "node platform/tools/party-smoke.mjs",
+    "platform:browser:score-race": "node platform/tools/score-race-browser.mjs",
+    "platform:init": "node platform/examples/init-production-env.mjs",
+    "platform:workload": "node platform/tools/create-workload-token.mjs",
+    "platform:register": "node platform/tools/register-game.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "playwright": "1.63.0",
+    "typescript": "5.9.3"
+  }
+}

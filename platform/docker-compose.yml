@@ -1,0 +1,94 @@
+name: arcane-platform
+services:
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_DB: arcane
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate platform/.env before starting}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d arcane"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  nakama:
+    image: arcane-platform-nakama:0.1.0
+    build:
+      context: ..
+      dockerfile: platform/Dockerfile
+      target: nakama
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        /nakama/nakama migrate up --database.address "postgres:${POSTGRES_PASSWORD:?Generate platform/.env}@postgres:5432/arcane" &&
+        exec /nakama/nakama --config /nakama/data/arcane.yml
+        --database.address "postgres:${POSTGRES_PASSWORD}@postgres:5432/arcane"
+        --socket.server_key "${NAKAMA_SERVER_KEY:?Generate platform/.env}"
+        --runtime.http_key "${NAKAMA_HTTP_KEY:?Generate platform/.env}"
+        --session.encryption_key "${NAKAMA_SESSION_KEY:?Generate platform/.env}"
+        --session.refresh_encryption_key "${NAKAMA_REFRESH_KEY:?Generate platform/.env}"
+        --console.username arcane-admin
+        --console.password "${NAKAMA_CONSOLE_PASSWORD:?Generate platform/.env}"
+        --runtime.env "ARCANE_GATEWAY_KEY=${ARCANE_GATEWAY_KEY:?Generate platform/.env}"
+        --runtime.env "ARCANE_ADMIN_KEY=${ARCANE_ADMIN_KEY:?Generate platform/.env}"
+        --runtime.env "ARCANE_ADAPTER_IDS=${ARCANE_ADAPTER_IDS:-turn-based-v1,score-race-v1}"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "/nakama/nakama", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  gateway:
+    image: arcane-platform-gateway:0.1.0
+    build:
+      context: ..
+      dockerfile: platform/Dockerfile
+      target: gateway
+    depends_on:
+      nakama:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      ARCANE_BIND_HOST: 0.0.0.0
+      ARCANE_PORT: "7400"
+      NAKAMA_URL: http://nakama:7350
+      NAKAMA_SERVER_KEY: ${NAKAMA_SERVER_KEY:?Generate platform/.env}
+      NAKAMA_HTTP_KEY: ${NAKAMA_HTTP_KEY:?Generate platform/.env}
+      ARCANE_GATEWAY_KEY: ${ARCANE_GATEWAY_KEY:?Generate platform/.env}
+      ARCANE_ADMIN_KEY: ${ARCANE_ADMIN_KEY:?Generate platform/.env}
+      ARCANE_TOKEN_SECRET: ${ARCANE_TOKEN_SECRET:?Generate platform/.env}
+      ARCANE_ADMIN_TOKEN: ${ARCANE_ADMIN_TOKEN:?Generate platform/.env}
+      ARCANE_MATCH_PRIVATE_KEY: ${ARCANE_MATCH_PRIVATE_KEY:?Generate platform/.env}
+      ARCANE_PUBLIC_URL: ${ARCANE_PUBLIC_URL:?Set the HTTPS trusted host URL}
+      ARCANE_ALLOWED_ORIGINS: ${ARCANE_ALLOWED_ORIGINS:?Set trusted host origins}
+      ARCANE_GAME_ORIGINS: ${ARCANE_GAME_ORIGINS:?Set separate HTTPS content origins}
+      ARCANE_PUBLISHER_KEYS: ${ARCANE_PUBLISHER_KEYS:-}
+      ARCANE_TRUSTED_PROXY_IPS: ${ARCANE_TRUSTED_PROXY_IPS:-}
+      ARCANE_LOCAL_DEVELOPMENT: "false"
+    ports:
+      - "127.0.0.1:${ARCANE_HOST_PORT:-7400}:7400"
+    networks: [backend, edge]
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+networks:
+  backend:
+    internal: true
+  edge:

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0",
+  "sdkVersion": "0.1",
+  "capabilities": ["profile", "storage", "friends", "chat", "party", "matchmaking", "match", "leaderboards", "achievements", "economy", "tournaments"],
+  "multiplayer": { "adapter": "turn-based-v1", "minPlayers": 2, "maxPlayers": 2 },
+  "leaderboards": {
+    "points": { "sort": "descending", "period": "all_time", "writePolicy": "verified_match_result", "metric": "points", "operator": "sum" }
+  },
+  "achievements": {
+    "first_win": { "name": "第一场胜利", "event": "match.won", "target": 1, "reward": { "coins": 100 } }
+  }
+}

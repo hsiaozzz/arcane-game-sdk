@@ -1,0 +1,175 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import pg from "pg";
+
+const connectionString = process.env.ARCANE_TEST_DATABASE_URL;
+test("real PostgreSQL runtime transactions and tenant isolation", { skip: !connectionString, timeout: 90000 }, async t => {
+  const admin = new pg.Client({ connectionString }); await admin.connect();
+  const schema = "arcane_rt_" + randomUUID().replaceAll("-", "");
+  assert.match(schema, /^arcane_rt_[a-f0-9]{32}$/);
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new pg.Pool({ connectionString, max: 8, options: `-c search_path=${schema},public` });
+  pool.on("error", () => {});
+  pool.on("connect", client => client.on("notice", notice => { if (notice.severity === "WARNING") console.log(notice.message); }));
+  const call = async (method, params = {}, { gameId = "demo", environment = "development", releaseId = "r1", user = A } = {}) => {
+    const q = await pool.query("SELECT arcane_execute($1,$2,$3,$4,$5,$6::jsonb) AS result", [params.gameId ?? gameId, params.environment ?? environment, params.releaseId ?? releaseId, user, method, JSON.stringify(params)]);
+    const value = q.rows[0].result; if (value?._error) throw Object.assign(new Error(value._error.message), { code: value._error.code }); return value;
+  };
+  const A = "bd78efde-00d4-4156-9a51-c37729f4f001", B = "bd78efde-00d4-4156-9a51-c37729f4f002", C = "bd78efde-00d4-4156-9a51-c37729f4f003";
+  const now = Date.now();
+  const manifest = { schemaVersion: "1.0", sdkVersion: "0.1", capabilities: ["profile","storage","friends","chat","party","matchmaking","match","leaderboards","achievements","economy","tournaments"], multiplayer: { adapter: "turn-based-v1", minPlayers: 2, maxPlayers: 2 }, leaderboards: { points: { sort: "descending", period: "all_time", writePolicy: "verified_match_result", metric: "points", operator: "sum" }, wins: { sort: "descending", period: "weekly", writePolicy: "verified_match_result", metric: "wins", operator: "sum" } }, achievements: { first_win: { name: "First win", event: "match.won", target: 1, reward: { coins: 100 } }, played: { name: "Played", event: "match.played", target: 1, reward: { coins: 10 } } }, tournaments: { launch: { name: "Launch", startAt: now - 60000, endAt: now + 3600000, leaderboardId: "points" } } };
+  let a, b, c, partyId, runId;
+  const rejects = (promise, code, message) => assert.rejects(promise, error => error.code === code && (!message || error.message === message));
+  try {
+    await pool.query(await readFile(new URL("../nakama/migrations/001_platform.sql", import.meta.url), "utf8"));
+    await t.test("migration repeats safely, release registration is immutable, user IDs are opaque and isolated", async () => {
+      await pool.query(await readFile(new URL("../nakama/migrations/001_platform.sql", import.meta.url), "utf8"));
+      const p = { gameId: "demo", environment: "development", releaseId: "r1", publisherId: "owner", buildHash: "hash1", entryUrl: "http://127.0.0.1:5208/demo.html", manifest };
+      await call("admin.registerGame", p); await call("admin.registerGame", p);
+      await rejects(call("admin.registerGame", { ...p, buildHash: "changed" }), 6, "RELEASE_IMMUTABLE");
+      await call("admin.registerGame", { ...p, gameId: "other" });
+      await call("admin.registerGame", { ...p, environment: "production" });
+      a = (await call("context.get")).gameUserId; b = (await call("context.get", {}, { user: B })).gameUserId; c = (await call("context.get", {}, { user: C })).gameUserId;
+      assert.match(a, /^gusr_[a-f0-9]{32}$/); assert.notEqual(a, b);
+      assert.notEqual((await call("context.get", {}, { gameId: "other" })).gameUserId, a);
+      assert.notEqual((await call("context.get", {}, { environment: "production" })).gameUserId, a);
+      assert.equal(JSON.stringify(await call("profile.get")).includes(A), false);
+      await rejects(call("admin.registerGame", { ...p, environment: "staging", publisherId: "another-owner" }), 6, "PUBLISHER_IMMUTABLE");
+      const pending = { ...p, releaseId: "pending", buildHash: "pending-hash", activate: false };
+      assert.equal((await call("admin.registerGame", pending)).active, false);
+      await rejects(call("context.get", {}, { releaseId: "pending" }), 7, "RELEASE_NOT_ACTIVE");
+      await rejects(call("admin.activateGame", { releaseId: "pending", buildHash: "wrong" }), 6, "RELEASE_HASH_MISMATCH");
+      assert.equal((await call("admin.activateGame", { releaseId: "pending", buildHash: "pending-hash" })).active, true);
+      assert.equal((await call("context.get", {}, { releaseId: "pending" })).releaseId, "pending");
+    });
+    await t.test("profile and saves use atomic CAS, including concurrent writers", async () => {
+      assert.equal((await call("profile.update", { expectedVersion: 1, displayName: "扫地王" })).version, 2);
+      await rejects(call("profile.update", { expectedVersion: 1, displayName: "stale" }), 6);
+      const saves = await Promise.allSettled([call("storage.write", { collection: "default", key: "save", expectedVersion: 0, value: { level: 1 } }), call("storage.write", { collection: "default", key: "save", expectedVersion: 0, value: { level: 2 } })]);
+      assert.equal(saves.filter(x => x.status === "fulfilled").length, 1); assert.equal(saves.filter(x => x.status === "rejected" && x.reason.code === 6).length, 1);
+      assert.equal((await call("storage.read", { collection: "default", key: "save" })).version, 1);
+      assert.deepEqual(await call("storage.read", { collection: "default", key: "save" }, { gameId: "other" }), { item: null });
+      assert.equal((await call("storage.list", { collection: "default" })).items.length, 1);
+      await rejects(call("storage.delete", { collection: "default", key: "save", expectedVersion: 9 }), 6);
+    });
+    await t.test("friends, persisted chat, party authorization and leadership are real SQL state", async () => {
+      await call("friends.request", { gameUserId: b });
+      assert.equal((await call("friends.list", {}, { user: B })).incoming[0].gameUserId, a);
+      await call("friends.accept", { gameUserId: a }, { user: B });
+      assert.equal((await call("friends.list")).friends.length, 1);
+      const channelId = (await call("chat.channels")).channels.find(x => x.type === "dm").channelId;
+      await call("chat.send", { channelId, text: "你好小拖把" });
+      assert.equal((await call("chat.history", { channelId }, { user: B })).messages[0].text, "你好小拖把");
+      await rejects(call("chat.history", { channelId }, { user: C }), 7);
+      partyId = (await call("party.create")).party.partyId;
+      await rejects(call("party.accept", { partyId }, { user: C }), 7);
+      await call("party.invite", { partyId, gameUserId: b }); await call("party.accept", { partyId }, { user: B });
+      assert.equal((await call("party.ready", { partyId, ready: true }, { user: B })).party.members.find(x => x.gameUserId === b).ready, true);
+      await call("party.leave", { partyId }); assert.equal((await call("party.get", { partyId }, { user: B })).party.leaderId, b);
+      await call("friends.block", { gameUserId: b }); assert.equal((await call("friends.list", {}, { user: B })).friends.length, 0);
+      await rejects(call("chat.send", { channelId, text: "blocked" }, { user: B }), 7);
+    });
+    await t.test("queue creates immutable namespaced matches and hides other rosters", async () => {
+      assert.equal((await call("matchmaking.join")).queue.status, "waiting");
+      const q = (await call("matchmaking.join", {}, { user: B })).queue;
+      assert.equal(q.status, "matched"); runId = q.matchRunId;
+      assert.equal((await call("matchmaking.status")).queue.matchRunId, runId);
+      const match = await call("match.get", { matchRunId: runId }); assert.deepEqual(match.gameUserIds.sort(), [a, b].sort());
+      assert.equal(match.result, null); assert.equal(match.state, null);
+      await rejects(call("match.get", { matchRunId: runId }, { user: C }), 7);
+      await rejects(call("match.get", { matchRunId: runId }, { releaseId: "pending" }), 7);
+      await call("admin.registerMatch", { matchRunId: runId, adapterId: "turn-based-v1", gameUserIds: [b, a] });
+      await rejects(call("admin.registerMatch", { matchRunId: runId, adapterId: "turn-based-v1", gameUserIds: [a, c] }), 6);
+    });
+    await t.test("host sessions revoke durably, one-use tickets reject replay, match state CAS survives reads", async () => {
+      const sessionId = randomUUID(), expiresAt = Date.now() + 60000;
+      await call("admin.createSession", { sessionId, platformUserId: A, expiresAt });
+      assert.equal((await call("admin.getSession", { sessionId })).revoked, false);
+      await call("admin.revokeSession", { sessionId }); await rejects(call("admin.getSession", { sessionId }), 16);
+      const ticket = { matchRunId: runId, gameUserId: a, releaseId: "r1", adapterId: "turn-based-v1", nonce: randomUUID(), expiresAt: Date.now() + 30000 };
+      await call("admin.consumeMatchTicket", ticket); await rejects(call("admin.consumeMatchTicket", ticket), 7, "MATCH_TICKET_REPLAY");
+      const admission = { ...ticket, nonce: randomUUID() }; delete admission.matchRunId;
+      await call("admin.consumeAdmissionTicket", admission); await rejects(call("admin.consumeAdmissionTicket", admission), 7);
+      assert.equal((await call("admin.saveMatchState", { matchRunId: runId, releaseId: "r1", adapterId: "turn-based-v1", expectedVersion: 0, state: { status: "playing", stones: 20 } })).stateVersion, 1);
+      await rejects(call("admin.saveMatchState", { matchRunId: runId, releaseId: "r1", adapterId: "turn-based-v1", expectedVersion: 0, state: { status: "playing", stones: 9 } }), 6);
+      assert.equal((await call("admin.getMatch", { matchRunId: runId })).state.stones, 20);
+      await call("admin.saveMatchState", { matchRunId: runId, releaseId: "r1", adapterId: "turn-based-v1", expectedVersion: 1, state: { status: "finished", stones: 0, winner: a, seqByPlayer: { [a]: 9 }, pendingResult: { secret: "private-envelope" }, futureServerSecret: "not-public", lastMove: { player: a, take: 3, privateNote: "not-public" } } });
+      assert.equal((await call("admin.pendingMatches", { adapterId: "turn-based-v1", limit: 100 })).matches.length, 1);
+      const pending = await call("match.get", { matchRunId: runId });
+      assert.equal(pending.result, null); assert.equal(pending.state.settlement, "pending"); assert.equal(pending.state.winner, a);
+      assert.deepEqual(pending.state.lastMove, { player: a, take: 3 });
+      assert.equal(JSON.stringify(pending).includes("not-public"), false); assert.equal(JSON.stringify(pending).includes("private-envelope"), false);
+      assert.equal(pending.state.seqByPlayer, undefined); assert.equal(pending.state.pendingResult, undefined);
+    });
+    const settlement = () => ({ matchRunId: runId, adapterId: "turn-based-v1", reason: "finished", results: [{ gameUserId: a, rank: 1, score: 50, points: 100, won: true }, { gameUserId: b, rank: 2, score: 20, points: 25, won: false }], finishedAt: Date.now() });
+    await t.test("active-match recovery pages all durable states with timestamp ties and opaque cursors", async () => {
+      const added = Array.from({ length: 5 }, (_, i) => "page:run:" + i);
+      for (const matchRunId of added) await call("admin.registerMatch", { matchRunId, adapterId: "turn-based-v1", gameUserIds: [a, b] });
+      await pool.query("UPDATE arcane_matches SET created_at=$1 WHERE match_run_id=ANY($2::text[])", [now, added]);
+      let after, found = [], pages = 0;
+      do {
+        const page = await call("admin.activeMatches", { adapterId: "turn-based-v1", limit: 2, ...(after ? { after } : {}) });
+        found.push(...page.matches); after = page.cursor;
+        assert.ok(++pages <= 10);
+      } while (after);
+      assert.equal(pages, 3); assert.equal(found.length, 6);
+      assert.equal(new Set(found.map(x => x.matchRunId)).size, 6);
+      assert.equal(found.find(x => x.matchRunId === runId).state.status, "finished");
+      assert.equal(found.find(x => x.matchRunId === added[0]).state, null);
+      assert.equal((await call("admin.activeMatches", { adapterId: "turn-based-v1", gameId: "other" })).matches.length, 0);
+    });
+    await t.test("concurrent settlement retries increment exactly once; conflicting replays fail", async () => {
+      await call("tournaments.join", { tournamentId: "launch" }); await call("tournaments.join", { tournamentId: "launch" }, { user: B });
+      const result = settlement();
+      const settled = await Promise.all([call("admin.settleMatch", result), call("admin.settleMatch", result)]);
+      assert.equal(settled.filter(x => !x.duplicate).length, 1);
+      await rejects(call("admin.settleMatch", { ...result, results: result.results.map(x => ({ ...x, points: x.points + 1 })) }), 6, "SETTLEMENT_REPLAY_CONFLICT");
+      const board = await call("leaderboards.list", { leaderboardId: "points" }); assert.equal(board.ownRecord.score, 100); assert.equal(board.total, 2);
+      assert.equal((await call("achievements.list")).achievements.find(x => x.id === "first_win").completed, true);
+      assert.equal((await call("achievements.list", {}, { user: B })).achievements.find(x => x.id === "first_win").completed, false);
+      assert.equal((await call("tournaments.standings", { tournamentId: "launch" })).ownRecord.score, 100);
+      assert.equal((await call("admin.pendingMatches", { adapterId: "turn-based-v1" })).matches.length, 0);
+      assert.equal((await call("admin.activeMatches", { adapterId: "turn-based-v1" })).matches.some(x => x.matchRunId === runId), false);
+      const recovered = await call("match.get", { matchRunId: runId });
+      assert.equal(recovered.state.stones, 0); assert.equal(recovered.state.settlement, "confirmed"); assert.equal(recovered.result.reason, "finished");
+      assert.equal(recovered.result.results.find(x => x.gameUserId === a).rank, 1); assert.equal(recovered.result.results.find(x => x.gameUserId === b).rank, 2);
+      assert.equal(JSON.stringify(recovered).includes(A), false); assert.equal(JSON.stringify(recovered).includes("private-envelope"), false);
+      await rejects(call("match.get", { matchRunId: runId }, { user: C }), 7);
+      await rejects(call("match.get", { matchRunId: runId }, { releaseId: "pending" }), 7);
+    });
+    await t.test("unapproved adapters expose no raw state through public match reads", async () => {
+      const gameId = "robo-private", roboManifest = structuredClone(manifest); roboManifest.multiplayer = { adapter: "robo-rumble-authoritative-v1", minPlayers: 2, maxPlayers: 12 };
+      await call("admin.registerGame", { gameId, releaseId: "r1", publisherId: "owner", buildHash: "robo-hash", manifest: roboManifest });
+      const ra = (await call("context.get", {}, { gameId })).gameUserId, rb = (await call("context.get", {}, { gameId, user: B })).gameUserId;
+      await call("admin.registerMatch", { gameId, matchRunId: "robo-hidden", adapterId: "robo-rumble-authoritative-v1", gameUserIds: [ra, rb] });
+      await call("admin.saveMatchState", { gameId, releaseId: "r1", matchRunId: "robo-hidden", adapterId: "robo-rumble-authoritative-v1", expectedVersion: 0, state: { status: "playing", secretMap: "private-state" } });
+      const exposed = await call("match.get", { matchRunId: "robo-hidden" }, { gameId });
+      assert.equal(exposed.state, null); assert.equal(exposed.result, null); assert.equal(JSON.stringify(exposed).includes("private-state"), false);
+      await call("admin.settleMatch", { gameId, matchRunId: "robo-hidden", adapterId: "robo-rumble-authoritative-v1", reason: "finished", results: [{ gameUserId: ra, rank: 3, score: 30, points: 30, won: false }, { gameUserId: rb, rank: 7, score: 10, points: 10, won: false }], finishedAt: Date.now() });
+      const recovered = await call("match.get", { matchRunId: "robo-hidden" }, { gameId });
+      assert.deepEqual(recovered.result.results.map(x => x.rank).sort((a, b) => a - b), [3, 7]);
+      assert.ok(recovered.result.results.every(x => !x.won)); assert.equal(recovered.state, null);
+    });
+    await t.test("earned reward remains immutable across releases and claim retries", async () => {
+      const next = structuredClone(manifest); next.achievements.first_win.reward.coins = 9000;
+      await call("admin.registerGame", { gameId: "demo", environment: "development", releaseId: "r2", publisherId: "owner", buildHash: "hash2", manifest: next });
+      const claims = await Promise.all([call("achievements.claim", { achievementId: "first_win" }, { releaseId: "r2" }), call("achievements.claim", { achievementId: "first_win" }, { releaseId: "r2" })]);
+      assert.equal(claims.filter(x => !x.duplicate).length, 1); assert.equal(claims[0].reward.coins, 100);
+      assert.equal((await call("economy.get")).currencies.coins, 100);
+      assert.equal((await call("economy.get", {}, { gameId: "other" })).currencies.coins, 0);
+    });
+    await t.test("database fault rolls back settlement event and every associated grant", async () => {
+      const matchRunId = "rollback-" + randomUUID();
+      await call("admin.registerMatch", { matchRunId, adapterId: "turn-based-v1", gameUserIds: [a, b] });
+      await pool.query("CREATE FUNCTION arcane_failpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.score>900 THEN RAISE EXCEPTION 'test failpoint'; END IF; RETURN NEW; END $$; CREATE TRIGGER arcane_test_fail BEFORE INSERT OR UPDATE ON arcane_board_records FOR EACH ROW EXECUTE FUNCTION arcane_failpoint()");
+      const result = { ...settlement(), matchRunId, results: [{ gameUserId: a, rank: 1, score: 1, points: 1000 }, { gameUserId: b, rank: 2, score: 1, points: 1 }] };
+      await rejects(call("admin.settleMatch", result), 13, "DATABASE_OPERATION_FAILED");
+      assert.equal(Number((await pool.query("SELECT count(*) FROM arcane_settlements WHERE match_run_id=$1", [matchRunId])).rows[0].count), 0);
+      assert.equal((await call("leaderboards.list", { leaderboardId: "points" })).ownRecord.score, 100);
+      await pool.query("DROP TRIGGER arcane_test_fail ON arcane_board_records; DROP FUNCTION arcane_failpoint()");
+      assert.equal((await call("admin.settleMatch", result)).duplicate, false);
+    });
+  } finally { await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end(); }
+});
